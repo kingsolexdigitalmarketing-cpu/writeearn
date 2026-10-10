@@ -184,19 +184,16 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
       newCode = crypto.randomBytes(5).toString('hex').toUpperCase();
       collision = await client.query('SELECT 1 FROM users WHERE referral_code=$1', [newCode]);
     } while (collision.rowCount);
-    const created = await client.query(`INSERT INTO users(name,username,email,password_hash,referral_code) VALUES($1,$2,$3,$4,$5) RETURNING id,name,username,email,role,status,balance,total_earned,referral_code,created_at`, [name,username,email,hash,newCode]);
+    const created = await client.query(`INSERT INTO users(name,username,email,password_hash,referral_code,status) VALUES($1,$2,$3,$4,$5,'pending') RETURNING id,name,username,email,role,status,balance,total_earned,referral_code,created_at`, [name,username,email,hash,newCode]);
     const user = created.rows[0];
     if (referrer) {
       const settingRows = await client.query("SELECT key,value FROM settings WHERE key IN ('referral_mode','referral_signup_bonus','referral_first_task_bonus','referral_percentage')");
       const cfg = Object.fromEntries(settingRows.rows.map(x => [x.key,x.value]));
       const mode = ['signup_bonus','first_task_bonus','percentage_earnings'].includes(cfg.referral_mode) ? cfg.referral_mode : 'first_task_bonus';
       const rewardValue = mode === 'signup_bonus' ? Math.max(0, Number(cfg.referral_signup_bonus)||0) : mode === 'percentage_earnings' ? Math.min(50,Math.max(0,Number(cfg.referral_percentage)||0)) : Math.max(0,Number(cfg.referral_first_task_bonus)||0);
-      const initialStatus = mode === 'signup_bonus' ? (rewardValue > 0 ? 'rewarded' : 'qualified') : 'pending';
-      await client.query("INSERT INTO referrals(referrer_id,referred_user_id,status,reward_mode,reward_value,reward_total,qualified_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,CASE WHEN $3 IN ('rewarded','qualified') THEN NOW() ELSE NULL END,NOW())", [referrer.id,user.id,initialStatus,mode,rewardValue,initialStatus==='rewarded'?rewardValue:0]);
-      if (initialStatus === 'rewarded') {
-        await client.query('UPDATE users SET balance=balance+$1,total_earned=total_earned+$1,updated_at=NOW() WHERE id=$2',[rewardValue,referrer.id]);
-        await client.query("INSERT INTO ledger(user_id,kind,amount,reference_id,note) VALUES($1,'referral_reward',$2,$3,'Referral registration bonus')",[referrer.id,rewardValue,user.id]);
-      }
+      // A referral signup reward must not be credited until the new account is activated.
+      const initialStatus = 'pending';
+      await client.query("INSERT INTO referrals(referrer_id,referred_user_id,status,reward_mode,reward_value,reward_total,qualified_at,updated_at) VALUES($1,$2,$3,$4,$5,0,NULL,NOW())", [referrer.id,user.id,initialStatus,mode,rewardValue]);
     }
     await client.query('COMMIT');
     res.status(201).json({ token: signToken(user), user: toPublicUser(user) });
@@ -211,7 +208,8 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const result = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
   const user = result.rows[0];
   if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Email or password is incorrect.' });
-  if (user.status !== 'active') return res.status(403).json({ error: 'Your account is not active. Contact support.' });
+  if (user.status === 'pending') return res.status(403).json({ error: 'Your account is pending activation. Contact the WriteEarn agent on WhatsApp and complete the ₦1,000 activation fee; the agent must verify payment and activate your account.' });
+  if (user.status !== 'active') return res.status(403).json({ error: 'Your account is suspended. Contact support.' });
   res.json({ token: signToken(user), user: toPublicUser(user) });
 }));
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: toPublicUser(req.user) }));
@@ -358,8 +356,30 @@ app.patch('/api/admin/users/:id/status', auth, adminOnly, asyncRoute(async (req,
   const status = clean(req.body.status);
   if (!['active','suspended','pending'].includes(status)) return res.status(400).json({ error:'Status must be active, suspended, or pending.' });
   if (req.params.id === req.user.id) return res.status(400).json({ error:'You cannot change your own status.' });
-  const r = await pool.query("UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2 AND role='member' RETURNING id,name,username,email,role,status,balance,total_earned,created_at", [status,req.params.id]);
-  if (!r.rowCount) return res.status(404).json({ error:'Member not found.' }); res.json({ user:toPublicUser(r.rows[0]) });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const before = await client.query("SELECT id,status FROM users WHERE id=$1 AND role='member' FOR UPDATE", [req.params.id]);
+    if (!before.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error:'Member not found.' }); }
+    const r = await client.query("UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2 AND role='member' RETURNING id,name,username,email,role,status,balance,total_earned,created_at", [status,req.params.id]);
+    // Pay a configured signup referral reward only after the referred account is activated.
+    if (status === 'active' && before.rows[0].status !== 'active') {
+      const referral = await client.query("SELECT * FROM referrals WHERE referred_user_id=$1 FOR UPDATE", [req.params.id]);
+      if (referral.rowCount && referral.rows[0].status === 'pending' && referral.rows[0].reward_mode === 'signup_bonus') {
+        const reward = Math.max(0, Number(referral.rows[0].reward_value) || 0);
+        if (reward > 0) {
+          await client.query("UPDATE referrals SET status='rewarded',reward_total=$1,qualified_at=NOW(),updated_at=NOW() WHERE id=$2", [reward,referral.rows[0].id]);
+          await client.query('UPDATE users SET balance=balance+$1,total_earned=total_earned+$1,updated_at=NOW() WHERE id=$2', [reward,referral.rows[0].referrer_id]);
+          await client.query("INSERT INTO ledger(user_id,kind,amount,reference_id,note) VALUES($1,'referral_reward',$2,$3,'Referral registration bonus after account activation')", [referral.rows[0].referrer_id,reward,req.params.id]);
+        } else {
+          await client.query("UPDATE referrals SET status='qualified',qualified_at=NOW(),updated_at=NOW() WHERE id=$1", [referral.rows[0].id]);
+        }
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ user:toPublicUser(r.rows[0]) });
+  } catch (e) { await client.query('ROLLBACK'); throw e; }
+  finally { client.release(); }
 }));
 app.get('/api/admin/submissions', auth, adminOnly, asyncRoute(async (req,res)=>{
   const status = clean(req.query.status); const valid = ['pending','approved','rejected'].includes(status) ? status : '';
